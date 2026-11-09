@@ -1,0 +1,75 @@
+# Roadbook's patched build of kislerdm/neon v0.18.0 (upstream archived).
+# Only change: github.com/kislerdm/neon-sdk-go v0.22.0 -> v0.36.0, which knows
+# Neon's "build" subscription type ("unknown value: build" on refresh).
+# Builds the binaries Terraform installs from rb-infra's provider mirror and
+# publishes them as a GitHub release with a SHA256SUMS file. Unsigned on
+# purpose: a mirror is verified against the h1 hashes in rb-infra's lock file.
+name: roadbook-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v (e.g. 0.18.1)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # go.sum gets the new SDK's entries here (verified against sum.golang.org);
+      # the resulting go.mod/go.sum are uploaded and committed back afterwards.
+      - name: Resolve neon-sdk-go v0.36.0
+        run: |
+          go get github.com/kislerdm/neon-sdk-go@v0.36.0
+          go mod tidy
+          git --no-pager diff --stat -- go.mod go.sum
+          mkdir -p dist && cp go.mod go.sum dist/
+
+      - name: Build and test
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./... 2>&1 | tail -40
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux_amd64 darwin_arm64 darwin_amd64; do
+            os=${target%_*}; arch=${target#*_}
+            bin="terraform-provider-neon_v${VERSION}"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA}" -o "dist/$bin" .
+            (cd dist && zip -q "terraform-provider-neon_${VERSION}_${target}.zip" "$bin" && rm "$bin")
+          done
+          (cd dist && sha256sum ./*.zip | sed 's#  \./#  #' > "terraform-provider-neon_${VERSION}_SHA256SUMS")
+          cat dist/*SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: go-mod
+          path: |
+            dist/go.mod
+            dist/go.sum
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" dist/*.zip dist/*SHA256SUMS --target "${GITHUB_SHA}" \
+            --title "v${VERSION} (Roadbook patch: neon-sdk-go v0.36.0)" \
+            --notes "kislerdm/neon v0.18.0 with github.com/kislerdm/neon-sdk-go bumped to v0.36.0, which accepts Neon's \"build\" subscription type. Built for rb-infra's provider mirror; unsigned (verified by rb-infra's lock-file hashes)."
